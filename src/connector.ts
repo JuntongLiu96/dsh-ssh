@@ -1,4 +1,4 @@
-import ssh2, { type Client as SshClient, type ConnectConfig, type ClientChannel } from 'ssh2'
+import ssh2, { type Client as SshClient, type ConnectConfig, type ClientChannel, type Prompt, type KeyboardInteractiveCallback } from 'ssh2'
 import type { Duplex } from 'node:stream'
 import { connectHttpProxy, connectSocks5Proxy } from './proxy.js'
 import { SshCredentialVault } from './credentials.js'
@@ -154,6 +154,8 @@ async function connectClient(
   if (profile.authType === 'password') {
     if (!secrets.password) throw Object.assign(new Error('SSH password is not configured'), { code: 'CREDENTIAL_MISSING' })
     config.password = secrets.password
+    // PAM-backed servers may accept a password only through keyboard-interactive.
+    config.tryKeyboard = true
   } else if (profile.authType === 'private-key') {
     if (!secrets.privateKey) throw Object.assign(new Error('SSH private key is not configured'), { code: 'CREDENTIAL_MISSING' })
     config.privateKey = secrets.privateKey
@@ -171,10 +173,32 @@ async function connectClient(
   const client = new ssh2.Client()
   return new Promise((resolve, reject) => {
     let settled = false
+    let keyboardPasswordSent = false
+    const keyboardInteractive = (_name: string, _instructions: string, _language: string, prompts: Prompt[], finish: KeyboardInteractiveCallback): void => {
+      if (settled || signal?.aborted) return
+      try {
+        // Empty informational rounds do not consume the single password response.
+        if (prompts.length === 0) { finish([]); return }
+        const prompt = prompts[0]
+        if (keyboardPasswordSent || prompts.length !== 1 || prompt?.echo !== false || !/^password[ \t]*:[ \t]*(?![\s\S])/i.test(prompt.prompt)) {
+          finishReject(Object.assign(new Error('SSH server requires unsupported interactive authentication. Only a single hidden Password: prompt is supported; use a key or an interactive SSH client for MFA or password changes.'), { code: 'SSH_INTERACTIVE_UNSUPPORTED' }))
+          return
+        }
+        keyboardPasswordSent = true
+        finish([secrets.password!])
+      } catch (error) {
+        finishReject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+    const passwordChange = (): void => {
+      if (!settled) finishReject(Object.assign(new Error('SSH server requires a password change. Change it using an interactive SSH client before reconnecting.'), { code: 'SSH_PASSWORD_CHANGE_REQUIRED' }))
+    }
     const abort = (): void => finishReject(signal?.reason instanceof Error ? signal.reason : new Error('SSH connection was aborted'))
     const cleanup = (): void => {
       signal?.removeEventListener('abort', abort)
       client.off('ready', ready)
+      client.off('keyboard-interactive', keyboardInteractive)
+      client.off('change password', passwordChange)
     }
     const finishReject = (error: Error): void => {
       if (settled) return
@@ -193,6 +217,10 @@ async function connectClient(
     }
     signal?.addEventListener('abort', abort, { once: true })
     client.once('ready', ready)
+    if (profile.authType === 'password') {
+      client.on('keyboard-interactive', keyboardInteractive)
+      client.on('change password', passwordChange)
+    }
     // ssh2 can emit another error while tearing down a timed-out socket.
     // Keep a listener throughout the transport lifetime, including after ready.
     // Settled promises ignore later errors; operation-specific listeners still receive them.

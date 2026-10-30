@@ -1,6 +1,6 @@
 {
   "name": "@lemoncat7/dsh-ssh",
-  "version": "1.11.7",
+  "version": "1.11.7-juntong.1",
   "description": "Secure SSH, FTP/FTPS/SFTP file transfer, browser terminals, proxies, port forwarding, and session-scoped AI access for DeepSeek Harness",
   "keywords": [
     "deepseek-harness",
@@ -143,10 +143,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lemoncat7/dsh-ssh.git"
+    "url": "git+https://github.com/JuntongLiu96/dsh-ssh.git"
   },
   "bugs": {
-    "url": "https://github.com/lemoncat7/dsh-ssh/issues"
+    "url": "https://github.com/JuntongLiu96/dsh-ssh/issues"
   },
-  "homepage": "https://github.com/lemoncat7/dsh-ssh#readme"
+  "homepage": "https://github.com/JuntongLiu96/dsh-ssh#readme"
 }
