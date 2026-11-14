@@ -7,6 +7,7 @@ import { registerFileTransferTools } from '../lib/file-transfer-tools.js'
 import { SshStore } from '../lib/store.js'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { toolRegistry, promptPresentation } from './tool-registry.mjs'
 
 test('file tools expose and transfer only endpoints authorized to the owning session', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-ssh-file-tools-'))
@@ -18,7 +19,7 @@ test('file tools expose and transfer only endpoints authorized to the owning ses
     state.profiles.push({ id: 'host-hidden', name: 'Hidden', host: '127.0.0.2', port: 22, username: 'test', authType: 'agent', proxy: { type: 'none' }, keepAliveIntervalMs: 0, connectTimeoutMs: 5000, terminalType: 'xterm-256color', tags: [], createdAt: now, updatedAt: now })
     state.injections.push({ sessionId: 'session-test', profileIds: ['host-allowed'], fileEndpointIds: [], filePermission: 'transfer', requireFileApproval: false, permission: 'exec', requireCommandApproval: false, workingDirectories: {}, workingProjectIds: {}, updatedAt: now })
   })
-  const tools = new Map()
+  const registry = toolRegistry(), tools = registry.definitions
   let promptHandler
   const starts = []
   const files = {
@@ -30,7 +31,7 @@ test('file tools expose and transfer only endpoints authorized to the owning ses
     get() { throw new Error('not used') }, cancel() { throw new Error('not used') },
   }
   const agent = { session: { id: 'session-test' }, ctx: { on(event, handler) { if (event === 'system-prompt/assemble') promptHandler = handler; return () => {} } } }
-  const ctx = { tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name) } }, agents: { list() { return [agent] } }, on() { return () => {} } }
+  const ctx = { tools: registry, agents: { list() { return [agent] } }, on() { return () => {} } }
   const dispose = registerFileTransferTools(ctx, store, files, transfers)
   t.after(dispose)
   const execution = { agent, signal: new AbortController().signal }
@@ -42,8 +43,10 @@ test('file tools expose and transfer only endpoints authorized to the owning ses
   assert.equal(starts[0].ownerId, 'session-test')
   assert.equal(starts[0].request.conflictPolicy, 'fail')
   assert.match(tools.get('file_transfer_start').description, /Never replace it with an SSH command, temporary HTTP server/)
-  const assembly = { tools: [...tools.values()].map(tool => ({ name: tool.name })), contexts: [] }
-  await promptHandler(assembly, {}, async () => assembly)
+  registry.assertConditional()
+  assert.equal(registry.schemas(await registry.resolve(agent)).length, 7)
+  const assembly = promptPresentation()
+  await promptHandler(assembly, { toolSet: (await registry.resolve(agent)).toolSet }, async () => assembly)
   const fileContext = assembly.contexts.find(context => context.name === 'dsh-ssh:file-access')
   assert.match(fileContext.text, /Never start an HTTP or other file server/)
   assert.match(fileContext.text, /下载到本地/)
@@ -60,9 +63,9 @@ test('file tools expose and transfer only endpoints authorized to the owning ses
   await store.update(state => { state.injections[0].filePermission = 'browse' })
   const automatic = JSON.parse(await tools.get('file_endpoint_list').execute({}, execution))
   assert.equal(automatic.endpoints[0].permission, 'transfer')
-  const visible = { tools: [...tools.values()].map(tool => ({ name: tool.name })), contexts: [] }
-  await promptHandler(visible, {}, async () => visible)
-  assert.ok(visible.tools.some(tool => tool.name === 'file_download_to_local'))
+  const visible = promptPresentation()
+  await promptHandler(visible, { toolSet: (await registry.resolve(agent)).toolSet }, async () => visible)
+  assert.ok(registry.schemas(await registry.resolve(agent)).includes('file_download_to_local'))
   const reopened = await SshStore.open(join(directory, 'state.json'), store.settings())
   assert.deepEqual(reopened.injection('session-test').fileEndpointIds, ['sftp:host-allowed'])
   // A stale SFTP grant from an old client must not survive unmounting.
@@ -79,7 +82,7 @@ test('local download tool defaults to owning session cwd and follows approval, v
     sessionId: id, filePermission: permission, fileEndpointIds: ['ftp:allowed'], requireFileApproval: approval,
     allowLocalDownload: localDownload,
   } : undefined } }
-  const tools = new Map(), hooks = new Map()
+  const registry = toolRegistry(), tools = registry.definitions, hooks = new Map()
   let assemble
   const agent = { session: { id: 'owner', header: { cwd: root } }, ctx: { on(event, handler) { assemble = handler; return () => {} } } }
   const files = { async connect(id) {
@@ -89,17 +92,18 @@ test('local download tool defaults to owning session cwd and follows approval, v
       async download(_path, target, signal) { await pipeline(Readable.from(['ok']), target, { signal }) },
     }
   } }
-  const ctx = { tools: { register(tool) { tools.set(tool.name, tool); return () => {} } }, agents: { list: () => [agent] }, on(event, handler) { hooks.set(event, handler); return () => {} } }
+  const ctx = { tools: registry, agents: { list: () => [agent] }, on(event, handler) { hooks.set(event, handler); return () => {} } }
   const dispose = registerFileTransferTools(ctx, store, files, {})
   t.after(dispose)
   const exec = { agent, signal: new AbortController().signal }
   const download = tools.get('file_download_to_local')
   const args = { endpointId: 'ftp:allowed', remotePath: '/report.txt' }
   localDownload = false
-  const denied = { tools: [...tools.values()].map(t => ({ name: t.name })), contexts: [] }
-  await assemble(denied, {}, async () => denied)
-  assert.ok(denied.tools.some(t => t.name === 'file_download_to_local'))
-  assert.ok(denied.tools.some(t => t.name === 'file_upload_from_local'))
+  const denied = promptPresentation()
+  await assemble(denied, { toolSet: (await registry.resolve(agent)).toolSet }, async () => denied)
+  const admitted = registry.schemas(await registry.resolve(agent))
+  assert.ok(admitted.includes('file_download_to_local'))
+  assert.ok(admitted.includes('file_upload_from_local'))
   localDownload = true
   assert.equal((await hooks.get('tools/pre-execute')({ name: download.name, agent }, async () => 'continue')).kind, 'ask')
   approval = false
@@ -110,10 +114,20 @@ test('local download tool defaults to owning session cwd and follows approval, v
   assert.equal(await readFile(result.localPath, 'utf8'), 'ok'); assert.equal(connected, 1)
   permission = 'browse'
   await assert.rejects(download.execute(args, exec), /only permits/)
-  const assembly = { tools: [...tools.values()].map(t => ({ name: t.name })), contexts: [] }
-  await assemble(assembly, {}, async () => assembly)
-  assert.ok(!assembly.tools.some(t => t.name === download.name))
+  const assembly = promptPresentation()
+  await assemble(assembly, { toolSet: (await registry.resolve(agent)).toolSet }, async () => assembly)
+  const browseSet = await registry.resolve(agent)
+  assert.deepEqual(registry.schemas(browseSet), ['file_directory_list', 'file_endpoint_list', 'file_transfer_status'])
+  for (const name of ['file_download_to_local', 'file_upload_from_local', 'file_transfer_start', 'file_transfer_cancel']) {
+    assert.deepEqual(await registry.execute(name, null, exec, browseSet), { code: 'UNKNOWN_TOOL' })
+  }
   permission = 'transfer'; enabled = false
+  const noAccess = await registry.resolve(agent)
+  assert.deepEqual(registry.schemas(noAccess), [])
+  for (const name of tools.keys()) assert.deepEqual(await registry.execute(name, null, exec, noAccess), { code: 'UNKNOWN_TOOL' })
+  const noAccessPrompt = promptPresentation()
+  await assemble(noAccessPrompt, {}, async () => noAccessPrompt)
+  assert.equal(noAccessPrompt.contexts.length, 0)
   await assert.rejects(download.execute(args, exec), /No remote file endpoint/)
   assert.equal(connected, 1)
   enabled = true; delete agent.session.header.cwd

@@ -1,6 +1,6 @@
 import type { TerminalSignal } from '@deepseek-ai/dsh-terminal'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+import type { PromptPresentation } from '@deepseek-ai/dsh-system-prompt'
 import { defineTool, type ParameterSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import { executeSshCommand } from './exec.js'
@@ -36,7 +36,16 @@ export function registerSshTools(ctx: Context, store: SshStore, connector: SshCo
     forwardStartTool(store, forwards),
     forwardStopTool(store, forwards),
   ]
-  const disposers = tools.map(tool => ctx.tools.register(tool))
+  const disposers = tools.map(tool => ctx.tools.register(tool, {
+    when: ({ agent, signal }) => {
+      signal.throwIfAborted()
+      const injection = store.injection(agent.session.id)
+      if (injection === undefined || injection.profileIds.length === 0) return false
+      if (tool.name === 'ssh_exec') return injection.permission === 'exec'
+      if (TERMINAL_ONLY_TOOLS.has(tool.name) || tool.name === 'ssh_forward_start' || tool.name === 'ssh_forward_stop') return injection.permission === 'terminal'
+      return true
+    },
+  }))
   disposers.push(registerTemporaryAccess(ctx, store, connector))
 
   const disposeApproval = ctx.on('tools/pre-execute', async (exec, next) => {
@@ -242,33 +251,22 @@ function requireProfile(store: SshStore, exec: ToolRunContext, profileId: string
 
 function installModeToolVisibility(ctx: Context, store: SshStore): () => void {
   const attached = new Map<Agent, () => void>()
-  const inheritance = new Map<string, Promise<void>>()
-  const ensureInheritedAccess = (agent: Agent): Promise<void> => {
-    const childSessionId = String(agent.session.id)
-    const current = inheritance.get(childSessionId)
-    if (current !== undefined) return current
-    const parentSessionId = agent.session.header?.origin === 'subagent' ? undefined : agent.session.header?.parentSession
-    if (parentSessionId === undefined) return Promise.resolve()
-    const operation = store.inheritInjection(String(parentSessionId), childSessionId)
-      .then(inherited => {
-        if (inherited) ctx.logger.info(`dsh-ssh: inherited session access ${String(parentSessionId)} -> ${childSessionId}`)
-      })
-      .finally(() => { inheritance.delete(childSessionId) })
-    inheritance.set(childSessionId, operation)
-    return operation
-  }
   const attach = (agent: Agent): void => {
     if (attached.has(agent)) return
-    const dispose = agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-      await ensureInheritedAccess(agent)
+    const dispose = agent.ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
       const result = await next()
-      applyModeToolVisibility(result, store.injection(agent.session.id)?.permission)
+      const injection = store.injection(agent.session.id)
+      const available = ['ssh_list', 'ssh_set_cwd', 'ssh_exec', ...TERMINAL_ONLY_TOOLS, 'ssh_forward_list', 'ssh_forward_start', 'ssh_forward_stop']
+        .filter(name => {
+          if (injection === undefined || injection.profileIds.length === 0 || ctx.tools.executable(name, agent, context.toolSet) === undefined) return false
+          if (name === 'ssh_exec') return injection.permission === 'exec'
+          if (TERMINAL_ONLY_TOOLS.has(name) || name === 'ssh_forward_start' || name === 'ssh_forward_stop') return injection.permission === 'terminal'
+          return true
+        })
+      applyModeToolVisibility(result, injection?.permission, available)
       return result
     })
     attached.set(agent, dispose)
-    void ensureInheritedAccess(agent).catch(error => {
-      ctx.logger.warn(`dsh-ssh: failed to inherit access for session ${String(agent.session.id)}: ${String(error)}`)
-    })
   }
   for (const agent of ctx.agents.list()) attach(agent)
   const disposeCreated = ctx.on('agent/created', ({ agent }) => { attach(agent); return undefined })
@@ -281,19 +279,17 @@ function installModeToolVisibility(ctx: Context, store: SshStore): () => void {
     disposeCreated()
     for (const dispose of attached.values()) dispose()
     attached.clear()
-    inheritance.clear()
   }
 }
 
-function applyModeToolVisibility(assembly: PromptAssembly, permission: 'exec' | 'terminal' | undefined): void {
-  if (permission === undefined) return
-  assembly.tools = assembly.tools.filter(schema => permission === 'terminal' ? schema.name !== 'ssh_exec' : !TERMINAL_ONLY_TOOLS.has(schema.name))
-  assembly.contexts.push({
-    name: 'dsh-ssh:permission-mode',
-    text: permission === 'terminal'
-      ? 'SSH permission mode: terminal control. Open one terminal for each required SSH host and working directory, retain the terminalId returned by ssh_terminal_open, and use that same terminalId for subsequent ssh_terminal_send/read calls. Do not call ssh_terminal_open again before each command. If the terminalId is unavailable, ssh_terminal_open is idempotent and safely returns the existing terminal. ssh_exec is intentionally unavailable so commands and output remain visible in SSH Activity.'
-      : 'SSH permission mode: one-shot commands. Use ssh_exec; interactive terminal tools are intentionally unavailable.',
-  })
+function applyModeToolVisibility(assembly: PromptPresentation, permission: 'exec' | 'terminal' | undefined, available: string[]): void {
+  if (permission === undefined || available.length === 0) return
+  const text = [`SSH permission mode: ${permission === 'terminal' ? 'terminal control' : 'one-shot commands'}. Available SSH tools this step: ${available.join(', ')}.`]
+  if (available.includes('ssh_exec')) text.push('Use ssh_exec for one-shot commands.')
+  if (available.includes('ssh_terminal_open')) text.push('Open one terminal for each required SSH host and working directory, retain its terminalId, and reuse that terminal. Do not call ssh_terminal_open before each command. If the terminalId is unavailable, ssh_terminal_open is idempotent and safely returns the existing terminal.')
+  if (available.includes('ssh_terminal_send')) text.push('Use ssh_terminal_send with the retained terminalId to send commands.')
+  if (available.includes('ssh_terminal_read')) text.push('Use ssh_terminal_read with the retained terminalId to read output.')
+  assembly.contexts.push({ name: 'dsh-ssh:permission-mode', text: text.join('\n') })
 }
 
 function requireForward(store: SshStore, exec: ToolRunContext, ruleId: string): void {

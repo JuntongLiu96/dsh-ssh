@@ -1,5 +1,5 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+import type { PromptPresentation } from '@deepseek-ai/dsh-system-prompt'
 import { defineTool, type ParameterSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import type { TransferConflictPolicy } from './file-transfer-manager.js'
@@ -10,7 +10,6 @@ import { SessionFileDownloads } from './session-file-download.js'
 import { SessionFileUploads } from './session-file-upload.js'
 import { canTransferFiles, requiresFileApproval } from './file-access-policy.js'
 
-const FILE_TOOL_NAMES = new Set(['file_endpoint_list', 'file_directory_list', 'file_transfer_start', 'file_transfer_status', 'file_transfer_cancel', 'file_download_to_local', 'file_upload_from_local'])
 const TRANSFER_TOOL_NAMES = new Set(['file_transfer_start', 'file_transfer_cancel', 'file_download_to_local', 'file_upload_from_local'])
 const output = { schema: { type: 'string' as const }, render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: String(value) }] }
 
@@ -20,7 +19,14 @@ export function registerFileTransferTools(ctx: Context, store: SshStore, files: 
   const downloads = new SessionFileDownloads(files)
   const uploads = new SessionFileUploads(files)
   const definitions = [endpointListTool(store, files), directoryListTool(store, files), transferStartTool(store, transfers), transferStatusTool(store, transfers), transferCancelTool(store, transfers), downloadTool(store, downloads), uploadTool(store, uploads)]
-  const disposers = definitions.map(definition => ctx.tools.register(definition))
+  const disposers = definitions.map(definition => ctx.tools.register(definition, {
+    when: ({ agent, signal }) => {
+      signal.throwIfAborted()
+      const injection = store.injection(agent.session.id)
+      if (injection === undefined || injection.fileEndpointIds.length === 0) return false
+      return !TRANSFER_TOOL_NAMES.has(definition.name) || injection.fileEndpointIds.some(id => canTransferFiles(injection, id))
+    },
+  }))
   const disposeApproval = ctx.on('tools/pre-execute', async (exec, next) => {
     if (exec.name !== 'file_transfer_start' && exec.name !== 'file_download_to_local' && exec.name !== 'file_upload_from_local') return next()
     const injection = exec.agent === undefined ? undefined : store.injection(exec.agent.session.id)
@@ -164,8 +170,15 @@ function installVisibility(ctx: Context, store: SshStore): () => void {
   const attached = new Map<Agent, () => void>()
   const attach = (agent: Agent): void => {
     if (attached.has(agent)) return
-    attached.set(agent, agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-      const result = await next(); applyVisibility(result, store.injection(agent.session.id)); return result
+    attached.set(agent, agent.ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+      const result = await next()
+      const injection = store.injection(agent.session.id)
+      const available = ['file_endpoint_list', 'file_directory_list', 'file_transfer_status', ...TRANSFER_TOOL_NAMES]
+        .filter(name => injection !== undefined && injection.fileEndpointIds.length > 0
+          && ctx.tools.executable(name, agent, context.toolSet) !== undefined
+          && (!TRANSFER_TOOL_NAMES.has(name) || injection.fileEndpointIds.some(id => canTransferFiles(injection, id))))
+      applyVisibility(result, injection, available)
+      return result
     }))
   }
   for (const agent of ctx.agents.list()) attach(agent)
@@ -174,20 +187,25 @@ function installVisibility(ctx: Context, store: SshStore): () => void {
   return () => { disposed(); created(); for (const dispose of attached.values()) dispose(); attached.clear() }
 }
 
-function applyVisibility(assembly: PromptAssembly, injection: ReturnType<SshStore['injection']>): void {
-  if (injection === undefined || (injection.fileEndpointIds ?? []).length === 0) { assembly.tools = assembly.tools.filter(schema => !FILE_TOOL_NAMES.has(schema.name)); return }
-  if (!injection.fileEndpointIds.some(id => canTransferFiles(injection, id))) assembly.tools = assembly.tools.filter(schema => !TRANSFER_TOOL_NAMES.has(schema.name))
-  assembly.contexts.push({
-    name: 'dsh-ssh:file-access',
-    text: `Remote file access is limited to authorized endpoints. Mounted SSH hosts automatically authorize their SFTP endpoints for browsing and transfer, with the host command-approval policy. FTP/FTPS permission: ${injection.filePermission}. Use file_endpoint_list for each endpoint's effective permission; do not apply SFTP permissions to FTP endpoints.
-Use file_endpoint_list to discover authorized file endpoints, file_directory_list to list directories, and file_transfer_* to copy files between endpoints. Listing or reading remote contents is not file delivery and does not require downloading. Never guess endpoint ids or paths.
-${DOWNLOAD_USAGE}
-When a saved local copy is actually needed, file_download_to_local saves it in the current DSH session directory by default; report its returned localPath. Do not invent a sandbox URL or claim it was saved to the browser's Downloads folder.
-Transfer permission includes file_upload_from_local and file_download_to_local within the current session directory. Endpoint restrictions and transfer approval still apply. Browser computer uploads must be selected by the user in 文件传输.
-Never start an HTTP or other file server, open a temporary port, encode a file through a terminal, or invent another transport for file delivery.
-For a download to the user's browser-local computer, do not run terminal commands: directly tell the user to select the file in SSH → 文件传输 and click “下载到本地”. The conversation tool cannot attach those remote bytes itself.
-If the requested source or destination is not authorized, explain that directly instead of attempting a workaround.`,
-  })
+function applyVisibility(assembly: PromptPresentation, injection: ReturnType<SshStore['injection']>, available: string[]): void {
+  if (injection === undefined || injection.fileEndpointIds.length === 0 || available.length === 0) return
+  const text = [
+    `Remote file access is limited to authorized endpoints. Mounted SSH hosts authorize their SFTP endpoints for browsing and transfer, with the host command-approval policy. FTP/FTPS permission: ${injection.filePermission}. Do not apply SFTP permissions to FTP endpoints. Available remote file tools this step: ${available.join(', ')}.`,
+    'Listing or reading remote contents is not file delivery and does not require downloading. Never guess endpoint ids or paths.',
+  ]
+  if (available.includes('file_endpoint_list')) text.push("Use file_endpoint_list to discover authorized endpoints and each endpoint's effective permission.")
+  if (available.includes('file_directory_list')) text.push('Use file_directory_list to list authorized remote directories.')
+  if (available.includes('file_transfer_start')) text.push('Use file_transfer_start to copy files between endpoints that each permit transfer. Endpoint restrictions and transfer approval still apply.')
+  if (available.includes('file_download_to_local')) text.push(DOWNLOAD_USAGE, "When a saved local copy is actually needed, file_download_to_local saves it in the current DSH session directory by default; report its returned localPath. Do not invent a sandbox URL or claim it was saved to the browser's Downloads folder.")
+  if (available.includes('file_upload_from_local')) text.push('Use file_upload_from_local to upload a file from the current session directory to an endpoint that permits transfer. Endpoint restrictions and transfer approval still apply.')
+  if (!available.some(name => TRANSFER_TOOL_NAMES.has(name))) text.push('This step permits remote file browsing and transfer-status inspection only; file transfer, upload, download, and cancellation tools are unavailable.')
+  text.push(
+    'Browser computer uploads must be selected by the user in 文件传输.',
+    'Never start an HTTP or other file server, open a temporary port, encode a file through a terminal, or invent another transport for file delivery.',
+    'For a download to the user\'s browser-local computer, do not run terminal commands: directly tell the user to select the file in SSH → 文件传输 and click “下载到本地”. The conversation tool cannot attach those remote bytes itself.',
+    'If the requested source or destination is not authorized, explain that directly instead of attempting a workaround.',
+  )
+  assembly.contexts.push({ name: 'dsh-ssh:file-access', text: text.join('\n') })
 }
 
 function presentTitle(name: string, value: unknown): string { const args = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}; return typeof args.sourceEndpointId === 'string' ? `${name} · ${args.sourceEndpointId}` : name }
